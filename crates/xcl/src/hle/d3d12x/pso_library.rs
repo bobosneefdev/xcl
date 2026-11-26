@@ -48,6 +48,8 @@ pub struct MappedBlob {
     mapping: HANDLE,
     view: *const u8,
     len: usize,
+    /// The file's bytes with room after them, where it is not mapped (`open`).
+    copy: Vec<u8>,
 }
 
 // The view is strictly read-only and backed by immutable OS handles owned uniquely by `MappedBlob`.
@@ -81,6 +83,17 @@ impl MappedBlob {
                 CloseHandle(file);
                 return None;
             };
+            // AMD's driver reads a dword at the end of the blob in CreatePipelineLibrary
+            // (amdxc64.dll+0x176cd5). A view ends with its file's last page, so where the file
+            // ends less than 4 bytes before that, the read runs into the unmapped page after it.
+            // Such a file (4 lengths in 4096) is read into memory with room after it.
+            const PAGE: usize = 4096;
+            if (PAGE - len % PAGE) % PAGE < 4 {
+                CloseHandle(file);
+                let mut copy = std::fs::read(path).ok().filter(|c| c.len() == len)?;
+                copy.extend_from_slice(&[0; 4]);
+                return Some(Self { path: path.to_path_buf(), file: std::ptr::null_mut(), mapping: std::ptr::null_mut(), view: copy.as_ptr(), len, copy });
+            }
             let mapping = CreateFileMappingW(file, std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null());
             if mapping.is_null() {
                 CloseHandle(file);
@@ -98,6 +111,7 @@ impl MappedBlob {
                 mapping,
                 view: view.Value as *const u8,
                 len,
+                copy: Vec::new(),
             })
         }
     }
@@ -126,7 +140,7 @@ impl MappedBlob {
 impl Drop for MappedBlob {
     fn drop(&mut self) {
         unsafe {
-            if !self.view.is_null() {
+            if !self.view.is_null() && self.copy.is_empty() {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.view as *mut c_void });
             }
             if !self.mapping.is_null() {
@@ -476,8 +490,9 @@ impl MmapPipelineLibrary {
             match dev1.CreatePipelineLibrary::<ID3D12PipelineLibrary1>(blob.as_slice()) {
                 Ok(lib) => {
                     crate::xlog_info!(
-                        "D3D12.X: opened memory-mapped pipeline library gen-{gen:08x} ({:.1} MiB file-backed)",
-                        blob.len() as f64 / (1024.0 * 1024.0)
+                        "D3D12.X: opened memory-mapped pipeline library gen-{gen:08x} ({:.1} MiB {})",
+                        blob.len() as f64 / (1024.0 * 1024.0),
+                        if blob.copy.is_empty() { "file-backed" } else { "read into memory: the file ends at a page boundary" }
                     );
                     initial_read_handles.push(lib);
                     backing = Some(Arc::new(blob));
@@ -750,6 +765,27 @@ mod tests {
         let empty = dir.0.join("empty.plib");
         std::fs::write(&empty, b"").unwrap();
         assert!(MappedBlob::open(&empty).is_none());
+    }
+
+    /// The driver reads a dword at the end of the blob: it is readable whatever the file's length,
+    /// also where the file ends with its last page or less than 4 bytes before.
+    #[test]
+    fn mapped_blob_has_a_readable_dword_after_its_end() {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+        let dir = TempDir::new("end");
+        for len in [4096usize, 8190, 8191, 4093, 4092, 100] {
+            let path = dir.0.join(format!("{len}.plib"));
+            let payload: Vec<u8> = (0..len).map(|i| (i * 7) as u8 | 1).collect();
+            std::fs::write(&path, &payload).unwrap();
+            let blob = MappedBlob::open(&path).unwrap();
+            assert_eq!(blob.as_slice(), payload.as_slice(), "{len}");
+            let end = blob.as_ptr() as usize + len;
+            for p in [end, end + 3] {
+                let mut i: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                assert!(unsafe { VirtualQuery(p as *const c_void, &mut i, std::mem::size_of_val(&i)) } != 0 && i.State == MEM_COMMIT, "{len}");
+            }
+            assert_eq!(unsafe { (end as *const u32).read_unaligned() }, 0, "{len}");
+        }
     }
 
     #[test]
